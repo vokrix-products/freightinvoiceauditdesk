@@ -44,3 +44,4 @@ python3 run_demo.py
 python3 run_tests.py
 
 Railway: freightinvoiceauditdesk
+Cloudflare: freightinvoiceauditdesk.vokrix.co
