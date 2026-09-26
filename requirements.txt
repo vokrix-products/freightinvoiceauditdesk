@@ -1,4 +1,4 @@
-requests
 openai
+requests
 pdfplumber
 openpyxl

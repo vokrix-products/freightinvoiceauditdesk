@@ -1,590 +1,623 @@
 import csv
 import io
-import json
-import os
 import re
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-import openpyxl
 import pdfplumber
-from openai import OpenAI
+from openpyxl import load_workbook
+
+from llm_extractor import extract_from_unstructured_text
+
+STATUS_MISSING = "missing:critical"
+STATUS_EXPIRED = "expired:warning"
+STATUS_VALID = "valid:good"
+STATUS_FLAGGED = "flagged:critical"
+STATUS_CONTRACT_REVIEW = "contract-review:warning"
+STATUS_UNMAPPED = "unmapped:warning"
+
+FLOAT_TOLERANCE = 0.01
+
+NUMERIC_FIELDS = {
+    "actual_weight",
+    "billable_weight",
+    "freight_charge",
+    "fuel_surcharge",
+    "accessorial_charges",
+    "total_charges",
+    "minimum_charge",
+    "base_rate",
+    "expected_freight_charge",
+    "expected_fuel_surcharge",
+    "expected_accessorial_charges",
+    "total_expected_charge",
+    "variance",
+    "overcharge_amount",
+}
+
+KEY_ALIASES_RAW = {
+    "invoice_number": ["invoice number", "invoice no", "invoice #", "invoice_num", "invoiceid", "inv no", "invoice_number"],
+    "carrier_name": ["carrier name", "carrier", "supplier", "vendor name", "vendor", "carrier_name"],
+    "ship_date": ["ship date", "shipment date", "shipping date", "date shipped", "shipdate", "ship_date"],
+    "bill_of_lading_pro_number": ["bill of lading", "pro number", "pro no", "bol", "bol/pro", "bol_number", "pro_number", "bill of lading / pro number"],
+    "origin_location": ["origin location", "origin", "origin city", "origin address", "origin city/state/postal code", "origin_zip", "origin zone"],
+    "destination_location": ["destination location", "destination", "destination city", "destination address", "destination city/state/postal code", "destination_zip", "destination zone"],
+    "actual_weight": ["actual weight", "actual weight (lbs)", "actual_weight", "weight"],
+    "billable_weight": ["billable weight", "billed weight", "billable_weight", "billing weight"],
+    "freight_charge": ["freight charge", "freight", "freight charges", "freight_charge", "linehaul", "line haul", "linehaul charge", "line haul charge"],
+    "fuel_surcharge": ["fuel surcharge", "fuel", "fuel_surcharge", "fsc"],
+    "accessorial_codes": ["accessorial code", "accessorial codes", "accessorial_code"],
+    "accessorial_descriptions": ["accessorial description", "accessorial descriptions", "accessorial_desc"],
+    "accessorial_charges": ["accessorial charge", "accessorial charges", "accessorial_charge"],
+    "total_charges": ["total charges", "total charge", "total", "invoice total", "total_charges", "price", "amount", "total_amount", "total amount", "grand total", "invoice amount"],
+    "payment_due_date": ["payment due date", "due date", "payment_due_date", "due_date", "invoice due date"],
+    "currency": ["currency", "curr"],
+    "invoice_line_items": ["invoice line item details", "line item details", "line_items", "invoice line-item details", "invoice_line_items"],
+    "source_file_name": ["source file name", "source filename", "filename"],
+    "contract_rate_sheet_identifier": ["contract/rate-sheet identifier", "contract id", "rate sheet id", "rate_sheet_id", "contract_rate_sheet_identifier", "contract_reference"],
+    "effective_date": ["effective date", "effective", "eff date", "effective_date", "rate_sheet_effective_date", "rate sheet effective date"],
+    "expiration_date": ["expiration date", "expiration", "exp date", "expiration_date", "rate_sheet_expiration_date", "rate sheet expiration date"],
+    "origin_zone_zip_postal": ["origin zone/zip/postal code", "origin zone", "origin_zip", "origin postal", "origin_zone", "origin_zone_zip_postal"],
+    "destination_zone_zip_postal": ["destination zone/zip/postal code", "destination zone", "destination_zip", "destination postal", "destination_zone", "destination_zone_zip_postal"],
+    "freight_class_commodity": ["freight class/commodity", "freight class", "commodity", "class", "freight_class", "product", "freight_class_commodity"],
+    "rate_basis": ["rate basis", "rate_basis", "basis"],
+    "minimum_charge": ["minimum charge", "minimum_charge", "min charge"],
+    "base_rate": ["base rate", "base_rate", "rate"],
+    "fuel_surcharge_table": ["fuel surcharge table/percentage schedule", "fuel surcharge table", "fuel schedule", "fuel percentage", "fuel_surcharge_table", "fuel_surcharge_schedule", "fuel surcharge schedule"],
+    "accessorial_rule_code_description_amount": ["accessorial rule/code/description/amount", "accessorial rule", "accessorial code"],
+    "expected_freight_charge": ["expected freight charge", "expected freight", "expected_freight_charge"],
+    "expected_fuel_surcharge": ["expected fuel surcharge", "expected fuel", "expected_fuel_surcharge"],
+    "expected_accessorial_charges": ["expected accessorial charges", "expected accessorial", "expected_accessorial_charges"],
+    "total_expected_charge": ["total expected charge", "total expected", "total_expected_charge"],
+    "variance": ["variance"],
+    "overcharge_amount": ["overcharge amount", "overcharge"],
+    "matched_rate_line_reference": ["matched rate line reference", "matched rate line"],
+    "invoice_status": ["invoice status"],
+    "rate_sheet_status": ["rate-sheet status", "rate sheet status"],
+    "mapping_template_version": ["mapping template version"],
+}
 
 
-STATUSES = [
-    "New",
-    "Parsing",
-    "Parsed",
-    "Missing rate card",
-    "Missing document",
-    "Matched",
-    "Exception",
-    "Flagged overbill",
-    "Pending approval",
-    "Approved to pay",
-    "Disputed",
-    "Awaiting carrier",
-    "Recovered",
-    "Written off",
-    "Duplicate",
-    "Needs review",
-    "Low extraction confidence",
-]
-
-LINE_ITEM_STATUSES = [
-    "Valid",
-    "Missing rate",
-    "Expired rate",
-    "Rate mismatch",
-    "Weight-break mismatch",
-    "Min-charge violation",
-    "Discount not applied",
-    "Unauthorized accessorial",
-    "Fuel-surcharge mismatch",
-    "Fuel-index mismatch",
-    "Duplicate line",
-    "Tax mismatch",
-    "Currency mismatch",
-    "Flagged",
-    "Dispute-ready",
-    "Disputed",
-    "Recovered",
-    "Written off",
-    "Needs review",
-]
-
-RATE_CARD_STATUSES = [
-    "Missing",
-    "Uploaded",
-    "Parsing",
-    "Needs normalization",
-    "Active",
-    "Expiring soon",
-    "Expired",
-    "Superseded",
-    "Carrier mismatch",
-    "Mode mismatch",
-    "Needs review",
-]
-
-ALERT_STATUSES = [
-    "No alert",
-    "Alert pending",
-    "Alert sent",
-    "Alert acknowledged",
-    "Escalated due to aging",
-    "Dispute response overdue",
-]
-
-APPROVAL_STATUSES = [
-    "Awaiting reviewer",
-    "Awaiting AP",
-    "Approved",
-    "Rejected",
-    "Escalated",
-    "Disputed",
-    "Closed",
-]
-
-INVOICE_HEADER_FIELDS = [
+# Fields that prove a document really is an invoice / rate sheet. Detection scores
+# these by VALUE. It must not use key presence: the extractor returns the whole
+# schema with explicit nulls, so every document has an invoice_number key.
+INVOICE_MARKER_FIELDS = (
     "invoice_number",
     "invoice_date",
-    "due_date",
-    "carrier_name",
-    "carrier_scac",
-    "carrier_account_number",
-    "bill_to_name",
-    "remit_to_name",
-    "purchase_order_number",
-    "shipment_reference",
-    "pro_number",
-    "bol_number",
-    "load_number",
-    "shipment_date",
-    "delivery_date",
-    "origin_city",
-    "origin_state",
-    "origin_zip",
-    "origin_country",
-    "destination_city",
-    "destination_state",
-    "destination_zip",
-    "destination_country",
-    "mode",
-    "service_level",
-    "equipment_type",
-    "payment_terms",
-    "invoice_currency",
-    "total_billed_amount",
-    "total_expected_amount",
-    "total_variance_amount",
-    "total_variance_percent",
-    "invoice_status",
-    "source_channel",
-    "received_at",
-    "parsed_at",
-    "extraction_confidence",
-]
+    "ship_date",
+    "freight_charge",
+    "invoice_line_items",
+    "total_charges",
+    "bill_of_lading_pro_number",
+)
 
-LINE_ITEM_FIELDS = [
-    "line_number",
-    "charge_code",
-    "charge_description",
-    "billed_amount",
-    "expected_amount",
-    "variance_amount",
-    "variance_percent",
-    "rate_basis",
-    "billed_rate",
-    "expected_rate",
-    "quantity",
-    "weight",
-    "pieces",
-    "pallets",
-    "linear_feet",
-    "miles",
-    "fuel_surcharge_billed",
-    "fuel_surcharge_expected",
-    "accessorial_code",
-    "accessorial_description",
-    "accessorial_billed",
-    "accessorial_expected",
-    "accessorial_authorized_flag",
-    "discount_billed",
-    "discount_expected",
-    "tax_billed",
-    "tax_expected",
-    "rate_card_reference",
-    "tariff_reference",
-    "contract_clause_reference",
-    "fuel_index_provider",
-    "fuel_index_date",
-    "fuel_index_rate",
-    "duplicate_flag",
-    "line_status",
-    "dispute_status",
-    "aging_days",
-    "recovery_status",
-]
-
-RATE_CARD_FIELDS = [
-    "carrier_name",
-    "carrier_scac",
-    "mode",
-    "service_level",
-    "origin_zone",
-    "destination_zone",
-    "origin_zip_range",
-    "destination_zip_range",
-    "weight_break",
-    "min_charge",
-    "rate_per_mile",
-    "rate_per_cwt",
-    "flat_rate",
-    "fuel_surcharge_table",
-    "fuel_index_provider",
-    "fuel_index_effective_date",
-    "accessorial_code",
-    "accessorial_rate",
-    "accessorial_conditions",
-    "discount_terms",
+RATE_SHEET_MARKER_FIELDS = (
+    "lanes",
+    "contract_rate_sheet_identifier",
     "effective_date",
-    "expiry_date",
-    "contract_clause_reference",
-    "rate_card_version",
-    "currency",
-    "upload_source",
-    "normalization_status",
-    "rate_card_status",
-]
-
-EVIDENCE_FIELDS = [
-    "evidence_pack_id",
-    "expected_vs_billed_summary",
-    "supporting_document_links",
-    "carrier_dispute_reference",
-    "dispute_submission_date",
-    "dispute_response_date",
-    "recovered_amount",
-    "write_off_amount",
-    "reviewer",
-    "reviewed_at",
-    "approval_status",
-    "audit_trail_notes",
-    "notification_status",
-]
-
-PRIMARY_ENTITY_KEYS = [
-    "carrier_name",
-    "carrier",
-    "vendor_name",
-    "vendor",
-    "supplier",
-    "supplier_name",
-    "bill_to_name",
-    "remit_to_name",
-    "customer_name",
-    "client_name",
-    "employee_name",
-    "patient_name",
-    "contract_party",
-    "counterparty",
-    "shipper_name",
-]
+    "expiration_date",
+    "rate_basis",
+    "base_rate",
+    "minimum_charge",
+    "fuel_surcharge_table",
+)
 
 
-def process_file(file_bytes: bytes) -> list[dict]:
-    """Process PDF, Excel, CSV, or plain text bytes.
-
-    Always tries PDF first, then Excel, then UTF-8 text/CSV fallback.
-    Returns a list of records with keys: title, status, details, due_date.
-    """
-    text = _extract_text_from_pdf(file_bytes)
-    rows = None
-
-    if text and text.strip():
-        rows = _parse_csv_dict_rows(text)
-
-    if rows is None:
-        rows = _extract_excel_dict_rows(file_bytes)
-
-    if rows is None:
-        decoded = file_bytes.decode("utf-8", errors="ignore").lstrip("\ufeff")
-        text = decoded
-        rows = _parse_csv_dict_rows(decoded)
-
-    if rows:
-        records = _rows_to_records(rows)
-        if any(record["title"] != "Unknown counterparty" for record in records):
-            return records
-
-    if text and text.strip():
-        return [_record_from_text(text)]
-
-    return [
-        {
-            "title": "Unknown counterparty",
-            "status": "Needs review",
-            "details": {},
-            "due_date": None,
-        }
-    ]
+def _token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def _extract_text_from_pdf(file_bytes: bytes) -> Optional[str]:
-    try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            pages = [page.extract_text() or "" for page in pdf.pages]
-            return "\n".join(pages)
-    except Exception:
+KEY_ALIASES = {
+    canonical: {_token(alias) for alias in aliases}
+    for canonical, aliases in KEY_ALIASES_RAW.items()
+}
+
+
+def _canonical_key(raw_key: str) -> str:
+    token = _token(str(raw_key))
+    for canonical, aliases in KEY_ALIASES.items():
+        if token in aliases:
+            return canonical
+    return str(raw_key).strip().lower().replace(" ", "_")
+
+
+def _clean_value(value: Any) -> Any:
+    if value is None:
         return None
-
-
-def _extract_excel_dict_rows(file_bytes: bytes) -> Optional[List[Dict[str, Any]]]:
-    try:
-        workbook = openpyxl.load_workbook(
-            io.BytesIO(file_bytes), read_only=True, data_only=True
-        )
-        sheet = workbook.active
-        raw_rows = []
-        for row in sheet.iter_rows(values_only=True):
-            raw_rows.append(
-                ["" if cell is None else str(cell).strip() for cell in row]
-            )
-
-        if not raw_rows:
+    if isinstance(value, str):
+        value = value.strip()
+        if value.lower() in {"none", "null", "nan", ""}:
             return None
+    return value
 
-        header = [str(value).strip().lower() for value in raw_rows[0]]
-        rows = []
-        for raw_row in raw_rows[1:]:
-            if any(value for value in raw_row):
-                row = {
-                    header[i] if i < len(header) else f"column_{i}": raw_row[i]
-                    for i in range(len(raw_row))
-                }
-                rows.append(row)
 
-        return rows or None
-    except Exception:
+def _to_float(value: Any) -> Any:
+    if value is None:
         return None
-
-
-def _parse_csv_dict_rows(text: str) -> Optional[List[Dict[str, Any]]]:
-    cleaned = text.strip()
-    if not cleaned:
+    if isinstance(value, bool):
         return None
-
-    sample = cleaned[:8192]
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace("$", "").replace(",", "").strip()
+    if not text or text.lower() in {"none", "null", "nan", ""}:
+        return None
     try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
-        delimiter = dialect.delimiter
-    except Exception:
-        if "," in cleaned:
-            delimiter = ","
-        elif "\t" in cleaned:
-            delimiter = "\t"
-        elif "|" in cleaned:
-            delimiter = "|"
-        else:
-            delimiter = ";"
-
-    try:
-        reader = csv.DictReader(io.StringIO(cleaned), delimiter=delimiter)
-        rows = []
-        for row in reader:
-            if any(
-                value is not None and str(value).strip()
-                for value in row.values()
-            ):
-                rows.append({key: value for key, value in row.items()})
-        return rows or None
-    except Exception:
+        return float(text)
+    except ValueError:
         return None
 
 
-def _rows_to_records(rows: List[Dict[str, Any]]) -> list[dict]:
-    records = []
-    for row in rows:
-        normalized = _normalize_row(row)
-        if not any(str(value).strip() for value in normalized.values()):
-            continue
-        records.append(_row_to_record(normalized))
-    return records
+def _has_value(record: Dict[str, Any], field: str) -> bool:
+    """True when a field carries real content. Nulls, blanks and empty
+    containers all mean the document did not actually provide that field."""
+    value = record.get(field)
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    if isinstance(value, (list, dict)):
+        return len(value) > 0
+    if isinstance(value, bool):
+        return value
+    return True
 
 
-def _row_to_record(row: Dict[str, Any]) -> dict:
-    title = _extract_title(row)
-    status = _extract_status(row)
-    due_date = _iso_date(
-        _first_nonempty(
-            row,
-            ["due_date", "due date", "invoice_due_date", "payment_due_date"],
-        )
-    )
-
-    details = dict(row)
-    for key in [
-        "due_date",
-        "due date",
-        "invoice_due_date",
-        "payment_due_date",
-        "status",
-        "invoice_status",
-    ]:
-        details.pop(key, None)
-
-    details.setdefault("source_channel", "upload")
-    details.setdefault("extraction_confidence", "high")
-
-    return {
-        "title": title,
-        "status": status,
-        "details": details,
-        "due_date": due_date,
-    }
-
-
-def _normalize_row(row: Dict[Any, Any]) -> Dict[str, Any]:
-    return {
-        str(key).strip().lower(): value
-        for key, value in row.items()
-        if key is not None
-    }
-
-
-def _first_nonempty(row: Dict[str, Any], keys: List[str]) -> Optional[Any]:
-    for key in keys:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return value
-    return None
-
-
-def _extract_title(row: Dict[str, Any]) -> str:
-    """Return the primary entity the buyer tracks, never document type."""
-    value = _first_nonempty(row, PRIMARY_ENTITY_KEYS)
-    if value:
-        return str(value).strip()
-
-    entity_words = (
-        "name",
-        "vendor",
-        "supplier",
-        "carrier",
-        "customer",
-        "party",
-        "account",
-        "shipper",
-    )
-    for key, value in row.items():
-        if value and any(word in str(key).lower() for word in entity_words):
-            return str(value).strip()
-
-    return "Unknown counterparty"
-
-
-def _extract_status(row: Dict[str, Any]) -> str:
-    raw = _first_nonempty(row, ["invoice_status", "status"])
-    if raw is None:
-        return "Parsed"
-
-    raw_text = str(raw).strip()
-    for allowed in STATUSES:
-        if allowed.lower() == raw_text.lower():
-            return allowed
-
-    return "Needs review"
-
-
-def _iso_date(value: Any) -> Optional[str]:
+def _parse_date(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.date().isoformat()
+        return value.date()
     if isinstance(value, date):
-        return value.isoformat()
-
+        return value
     text = str(value).strip()
-    if not text:
+    if not text or text.lower() in {"none", "null", "nan", ""}:
+        return None
+    for fmt in (
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%d-%b-%Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%Y/%m/%d",
+        "%Y-%m-%d %I:%M %p",
+        "%b %d, %Y %I:%M %p",
+        "%B %d, %Y %I:%M %p",
+    ):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except Exception:
         return None
 
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%Y%m%d"):
-        try:
-            return datetime.strptime(text, fmt).date().isoformat()
-        except Exception:
-            continue
 
-    match = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
+def _iso_date(value: Any) -> Any:
+    parsed = _parse_date(value)
+    if parsed:
+        return parsed.isoformat()
+    return None
+
+
+def _heuristic_carrier(text: str) -> Any:
+    match = re.search(r"(?:carrier|vendor|supplier|carrier name|vendor name)\s*[:|-]\s*([A-Za-z0-9 .&]+)", text, re.I)
     if match:
-        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+        return match.group(1).strip()
+    return None
 
-    return text[:10] if text else None
 
-
-def _record_from_text(text: str) -> dict:
-    clean_text = text.strip()
-    if not clean_text:
+def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    if "raw_text" in row:
+        raw = row.get("raw_text") or ""
         return {
-            "title": "Unknown counterparty",
-            "status": "Needs review",
-            "details": {},
-            "due_date": None,
+            "_type": "unknown",
+            "raw_text": raw,
+            "carrier_name": _heuristic_carrier(raw),
         }
 
-    if len(clean_text) > 200 and "DEEPSEEK_API_KEY" in os.environ:
-        extracted = _extract_header_with_llm(clean_text)
-        if extracted:
-            return _record_from_extracted(extracted, clean_text)
+    normalized: Dict[str, Any] = {}
+    for raw_key, value in row.items():
+        canonical = _canonical_key(raw_key)
+        normalized[canonical] = _clean_value(value)
 
-    carrier = _regex_extract_carrier(clean_text)
-    invoice_number = _regex_extract_invoice_number(clean_text)
-    due_date = _iso_date(_regex_extract_due_date(clean_text))
+    for field in NUMERIC_FIELDS:
+        if field in normalized:
+            normalized[field] = _to_float(normalized[field])
 
-    title = carrier or "Unknown counterparty"
-    details = {"raw_text": clean_text[:5000], "extraction_confidence": "low"}
-    if carrier:
-        details["carrier_name"] = carrier
-    if invoice_number:
-        details["invoice_number"] = invoice_number
+    return normalized
 
-    return {
-        "title": title,
-        "status": "Low extraction confidence",
-        "details": details,
-        "due_date": due_date,
+
+def _expand_rate_lanes(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Split a rate sheet with a lanes[] array into one record per rate line.
+
+    A rate sheet is audited line by line, and the per-row duplicate check in
+    _assign_status already assumes one row per lane. Every line inherits the
+    sheet-level fields (carrier, effective/expiration date, contract id); lane
+    fields win where they carry a value.
+    """
+    lanes = record.get("lanes")
+    if not isinstance(lanes, list) or not lanes:
+        return [record]
+
+    sheet_fields = {key: value for key, value in record.items() if key != "lanes"}
+    expanded: List[Dict[str, Any]] = []
+
+    for index, lane in enumerate(lanes):
+        if not isinstance(lane, dict):
+            continue
+        merged = dict(sheet_fields)
+        for raw_key, value in lane.items():
+            canonical = _canonical_key(raw_key)
+            cleaned = _clean_value(value)
+            if cleaned is not None:
+                merged[canonical] = cleaned
+        for field in NUMERIC_FIELDS:
+            if field in merged:
+                merged[field] = _to_float(merged[field])
+        merged["_rate_line_index"] = index
+        merged["_document_type_hint"] = "rate_sheet"
+        expanded.append(merged)
+
+    return expanded or [record]
+
+
+def _detect_document_type(record: Dict[str, Any]) -> str:
+    invoice_score = sum(1 for field in INVOICE_MARKER_FIELDS if _has_value(record, field))
+    rate_score = sum(1 for field in RATE_SHEET_MARKER_FIELDS if _has_value(record, field))
+
+    if rate_score > invoice_score:
+        return "rate_sheet"
+    if invoice_score:
+        return "invoice"
+    if rate_score:
+        return "rate_sheet"
+    if _has_value(record, "carrier_name"):
+        return "invoice"
+    return "unknown"
+
+
+def _assign_status(record: Dict[str, Any], all_rows: List[Dict[str, Any]]):
+    doc_type = record.get("_type") or "unknown"
+
+    if doc_type == "invoice":
+        required = ["invoice_number", "carrier_name", "ship_date", "freight_charge"]
+        missing = [field for field in required if record.get(field) in (None, "")]
+        if missing:
+            return STATUS_MISSING, [f"missing required fields: {', '.join(missing)}"]
+
+        invoice_no = str(record.get("invoice_number") or "").strip()
+        duplicate_count = sum(
+            1
+            for row in all_rows
+            if str(row.get("invoice_number") or "").strip() == invoice_no
+        )
+        if invoice_no and duplicate_count > 1:
+            return STATUS_FLAGGED, ["duplicate invoice number in file"]
+
+        total = record.get("total_charges")
+        freight = record.get("freight_charge")
+        fuel = record.get("fuel_surcharge")
+        accessorial = record.get("accessorial_charges")
+        if total is not None:
+            # Carriers lay the total out two different ways. Sometimes the fuel
+            # surcharge is its own line beside the accessorial subtotal, so all
+            # three components add up to the total. Sometimes fuel is the first
+            # line INSIDE the accessorial subtotal, so adding it a second time
+            # counts it twice and reports a correct invoice as overbilling -
+            # the worst false positive an audit product can produce. Accept
+            # either decomposition; a real mismatch still fails both.
+            separated = [
+                value for value in (freight, fuel, accessorial) if value is not None
+            ]
+            candidates: List[float] = []
+            if separated:
+                candidates.append(sum(separated))
+            if freight is not None and accessorial is not None and fuel is not None:
+                candidates.append(float(freight) + float(accessorial))
+            if candidates and all(
+                abs(float(total) - candidate) > FLOAT_TOLERANCE for candidate in candidates
+            ):
+                return STATUS_FLAGGED, ["total charges do not match freight+fuel+accessorial"]
+
+        variance_pairs = [
+            ("expected_freight_charge", "freight_charge"),
+            ("expected_fuel_surcharge", "fuel_surcharge"),
+            ("expected_accessorial_charges", "accessorial_charges"),
+            ("total_expected_charge", "total_charges"),
+        ]
+        for expected_field, actual_field in variance_pairs:
+            expected = record.get(expected_field)
+            actual = record.get(actual_field)
+            if expected is not None and actual is not None:
+                difference = float(actual) - float(expected)
+                if abs(difference) > FLOAT_TOLERANCE:
+                    return STATUS_FLAGGED, [f"variance for {expected_field}: {difference:.2f}"]
+
+        return STATUS_VALID, []
+
+    if doc_type == "rate_sheet":
+        required = ["carrier_name", "effective_date", "expiration_date", "rate_basis", "base_rate"]
+        missing = [field for field in required if record.get(field) in (None, "")]
+        if missing:
+            return STATUS_MISSING, [f"missing required rate sheet fields: {', '.join(missing)}"]
+
+        expiration = _parse_date(record.get("expiration_date"))
+        if expiration and expiration < date.today():
+            return STATUS_EXPIRED, ["rate sheet expired"]
+
+        # A "minimum charge above 3x base rate" rule used to live here. It
+        # compared a flat dollar minimum ($150.00) against a rate expressed per
+        # 100 lbs ($5.50), so 150 > 5.50 * 3 fired on every rate sheet carrying a
+        # minimum charge and pushed it to contract-review. It stayed hidden while
+        # every sheet on hand was expired, because the expiry branch returns
+        # first. Removed rather than re-tuned: the two figures are in different
+        # units, so there is no threshold that makes the comparison sound.
+
+        rate_key = (
+            record.get("origin_zone_zip_postal"),
+            record.get("destination_zone_zip_postal"),
+            record.get("freight_class_commodity"),
+        )
+        if rate_key[0] is not None or rate_key[1] is not None:
+            duplicate_count = sum(
+                1
+                for row in all_rows
+                if (
+                    row.get("origin_zone_zip_postal"),
+                    row.get("destination_zone_zip_postal"),
+                    row.get("freight_class_commodity"),
+                )
+                == rate_key
+            )
+            if duplicate_count > 1:
+                return STATUS_CONTRACT_REVIEW, ["duplicate rate line for same origin/destination/class"]
+
+        rate_basis = str(record.get("rate_basis") or "").lower()
+        if rate_basis not in {"flat", "minimum charge", "per unit"} and not record.get("fuel_surcharge_table"):
+            return STATUS_CONTRACT_REVIEW, ["missing fuel surcharge schedule"]
+
+        return STATUS_VALID, []
+
+    return STATUS_UNMAPPED, ["unable to identify document type"]
+
+
+DUPLICATE_UPLOAD_NOTE = "duplicate invoice number from a previous upload"
+
+
+def apply_cross_upload_duplicates(
+    result_records: List[Dict[str, Any]],
+    existing_invoice_numbers: Any,
+) -> List[Dict[str, Any]]:
+    """Flag records whose invoice number this customer has already had processed.
+
+    The duplicate check inside _assign_status can only see the rows produced by a
+    single process_file call, so a carrier billing the same invoice number across
+    two separate uploads was never caught - which is precisely the overbilling a
+    shipper wants surfaced. The poller passes in the invoice numbers already
+    stored for that customer and anything that repeats comes back flagged.
+
+    Kept as a pure function over the caller's data: the poller owns the customer
+    scope and the database access, this owns the decision. A duplicate overrides
+    valid/expired but never discards the existing notes, so a missing-field
+    reason stays visible alongside the duplicate reason.
+    """
+    existing = {
+        str(value).strip()
+        for value in (existing_invoice_numbers or [])
+        if value is not None
     }
+    existing.discard("")
+    if not existing:
+        return result_records
+
+    updated_records: List[Dict[str, Any]] = []
+    for item in result_records:
+        if not isinstance(item, dict):
+            updated_records.append(item)
+            continue
+
+        details = item.get("details")
+        if not isinstance(details, dict):
+            updated_records.append(item)
+            continue
+
+        invoice_number = details.get("invoice_number")
+        if invoice_number is None or not str(invoice_number).strip():
+            updated_records.append(item)
+            continue
+
+        if str(invoice_number).strip() not in existing:
+            updated_records.append(item)
+            continue
+
+        notes = list(details.get("_notes") or [])
+        if DUPLICATE_UPLOAD_NOTE not in notes:
+            notes.append(DUPLICATE_UPLOAD_NOTE)
+
+        updated = dict(item)
+        updated["details"] = {**details, "_notes": notes}
+        updated["status"] = STATUS_FLAGGED
+        updated_records.append(updated)
+
+    return updated_records
 
 
-def _record_from_extracted(header: Dict[str, Any], raw_text: Optional[str]) -> dict:
-    normalized = _normalize_row(header)
-    title = _extract_title(normalized)
-    status = _extract_status(normalized)
-    due_date = _iso_date(
-        _first_nonempty(normalized, ["due_date", "due date", "invoice_due_date"])
-    )
-
-    details = dict(normalized)
-    for key in ["due_date", "due date", "invoice_due_date", "status", "invoice_status"]:
-        details.pop(key, None)
-
-    if raw_text:
-        details["raw_text"] = raw_text[:5000]
-
-    return {
-        "title": title,
-        "status": status,
-        "details": details,
-        "due_date": due_date,
-    }
-
-
-def _extract_header_with_llm(text: str) -> Dict[str, Any]:
+def _try_pdf(file_bytes: bytes) -> List[Dict[str, Any]]:
     try:
-        client = OpenAI(
-            api_key=os.environ["DEEPSEEK_API_KEY"],
-            base_url="https://api.deepseek.com",
-        )
-        system_prompt = (
-            "Extract freight invoice header fields from the provided invoice text. "
-            "Return only valid JSON with keys matching invoice header field names. "
-            "The title field must be the primary entity the buyer tracks "
-            "(for freight invoices: carrier_name, vendor, supplier, or counterparty). "
-            "Never use the document type or category as the title."
-        )
-        user_prompt = f"Invoice text:\n{text[:12000]}\n\nExtract invoice header fields."
-        response = client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-        )
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```"):
-            content = content.strip("`")
-            if content.startswith("json"):
-                content = content[4:]
-        return json.loads(content)
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        if text.strip():
+            return [{"raw_text": text}]
     except Exception:
-        return {}
+        pass
+    return []
 
 
-def _regex_extract_carrier(text: str) -> Optional[str]:
-    patterns = [
-        r"carrier_name[:=\s]+([^\n,]+)",
-        r"carrier[:=\s]+([^\n,]+)",
-        r"vendor_name[:=\s]+([^\n,]+)",
-        r"supplier[:=\s]+([^\n,]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-    return None
+def _try_excel(file_bytes: bytes) -> List[Dict[str, Any]]:
+    try:
+        workbook = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    except Exception:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for worksheet in workbook.worksheets:
+        raw_rows = list(worksheet.iter_rows(values_only=True))
+        if not raw_rows:
+            continue
+
+        headers: List[str] = []
+        for header in raw_rows[0]:
+            if header is None or str(header).strip() == "":
+                headers.append("")
+            else:
+                headers.append(str(header).strip().lower())
+
+        if not any(headers):
+            continue
+
+        for values in raw_rows[1:]:
+            if not any(value is not None and str(value).strip() != "" for value in values):
+                continue
+            row: Dict[str, Any] = {}
+            for idx, value in enumerate(values):
+                key = headers[idx] if idx < len(headers) and headers[idx] else f"column_{idx}"
+                row[key] = value
+            rows.append(row)
+
+    return rows
 
 
-def _regex_extract_invoice_number(text: str) -> Optional[str]:
-    patterns = [
-        r"invoice_number[:=\s]+([^\n,]+)",
-        r"invoice\s*#?[:=\s]+([^\n,]+)",
-        r"\bINV[- ]?\d+\b",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip() if match.lastindex else match.group(0).strip()
-    return None
+def _try_text_or_csv(file_bytes: bytes) -> List[Dict[str, Any]]:
+    try:
+        text = file_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    if not text.strip():
+        return []
+
+    sample = text[:512]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+    except csv.Error:
+        dialect = None
+
+    if dialect:
+        try:
+            reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+            rows: List[Dict[str, Any]] = []
+            for row in reader:
+                if any(value is not None and str(value).strip() != "" for value in row.values()):
+                    cleaned: Dict[str, Any] = {}
+                    for key, value in row.items():
+                        if key is None:
+                            continue
+                        cleaned[str(key).strip().lower()] = value
+                    rows.append(cleaned)
+            if rows:
+                return rows
+        except Exception:
+            pass
+
+    return [{"raw_text": text}]
 
 
-def _regex_extract_due_date(text: str) -> Optional[str]:
-    patterns = [
-        r"due_date[:=\s]+([^\n,]+)",
-        r"due date[:=\s]+([^\n,]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-    return None
+def _extract_rows(file_bytes: bytes) -> List[Dict[str, Any]]:
+    rows = _try_pdf(file_bytes)
+    if rows:
+        return rows
+
+    rows = _try_excel(file_bytes)
+    if rows:
+        return rows
+
+    rows = _try_text_or_csv(file_bytes)
+    if rows:
+        return rows
+
+    return []
+
+
+def process_file(file_bytes: bytes) -> List[Dict[str, Any]]:
+    raw_rows = _extract_rows(file_bytes)
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in raw_rows:
+        if "raw_text" in row:
+            extracted = extract_from_unstructured_text(row["raw_text"])
+            if extracted:
+                for item in extracted:
+                    normalized = _normalize_row(item)
+                    if normalized:
+                        normalized_rows.append(normalized)
+            else:
+                normalized = _normalize_row(row)
+                if normalized:
+                    normalized_rows.append(normalized)
+        else:
+            normalized = _normalize_row(row)
+            if normalized:
+                normalized_rows.append(normalized)
+
+    normalized_rows = [row for row in normalized_rows if row]
+
+    expanded_rows: List[Dict[str, Any]] = []
+    for row in normalized_rows:
+        expanded_rows.extend(_expand_rate_lanes(row))
+    normalized_rows = expanded_rows
+
+    output: List[Dict[str, Any]] = []
+    for record in normalized_rows:
+        forced_type = record.pop("_document_type_hint", None)
+        document_type = forced_type or _detect_document_type(record)
+        record["_type"] = document_type
+
+        status, notes = _assign_status(record, normalized_rows)
+
+        title = (
+            record.get("carrier_name")
+            or record.get("supplier")
+            or record.get("vendor_name")
+            or "Unknown Vendor"
+        )
+        due_date_value = record.get("payment_due_date") or record.get("due_date")
+        if due_date_value is None and document_type == "rate_sheet":
+            # The "Due / Expires" column and the Upcoming Expirations widget both
+            # read due_date. A rate sheet has no payment due date, so without this
+            # the one document type that actually expires could never surface.
+            due_date_value = record.get("expiration_date")
+        due_date = _iso_date(due_date_value)
+
+        details: Dict[str, Any] = {}
+        for key, value in record.items():
+            if key in {
+                "carrier_name",
+                "supplier",
+                "vendor_name",
+                "payment_due_date",
+                "due_date",
+                "_type",
+                "title",
+                "status",
+            }:
+                continue
+            if key == "raw_text":
+                details["raw_text_snippet"] = str(value)[:500] if value else None
+                continue
+            details[key] = value
+
+        details["document_type"] = document_type
+        details["_notes"] = notes
+
+        output.append(
+            {
+                "title": title,
+                "status": status,
+                "details": details,
+                "due_date": due_date,
+            }
+        )
+
+    return output
